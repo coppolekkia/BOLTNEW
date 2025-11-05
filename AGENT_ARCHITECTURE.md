@@ -1767,6 +1767,580 @@ export async function streamText(
 
 ---
 
+## File Modification & Change Tracking
+
+### The Critical Question: How Does Editing Work?
+
+While new file creation via `<boltAction>` is straightforward, **editing existing files** involves a sophisticated tracking system that enables Claude to understand what changed without re-reading entire projects.
+
+### Key Insight
+
+**File creation and file editing use the same WebContainer API** (`writeFile`), but the **tracking layer** distinguishes between them to intelligently send only modifications back to Claude.
+
+---
+
+### 1. Two Types of File Operations
+
+| Operation | Source | Tracking | Sent to Claude |
+|-----------|--------|----------|----------------|
+| **New File Creation** | Claude's `<boltAction>` | Not tracked | No |
+| **File Editing** | User typing in editor | Tracked in `#modifiedFiles` | Yes (as diffs) |
+
+---
+
+### 2. File Modification Tracking System
+
+**Location**: `app/lib/stores/files.ts`
+
+**Data Structures**:
+
+```typescript
+class FilesStore {
+  // Stores ORIGINAL content when file is first edited and saved
+  #modifiedFiles: Map<string, string> = new Map();
+
+  // Current file content (synced with WebContainer)
+  files: MapStore<FileMap> = map({});
+
+  // Files with unsaved changes in editor
+  unsavedFiles: WritableAtom<Set<string>> = atom(new Set());
+}
+```
+
+**The Flow**:
+
+```
+1. User opens file in editor
+   → content: "console.log('Hello')"
+
+2. User types changes
+   → onChange event fires (debounced 150ms)
+   → setCurrentDocumentContent()
+   → added to unsavedFiles Set
+
+3. User saves (Ctrl+S)
+   → saveFile() called
+   → ORIGINAL content stored: #modifiedFiles.set("app.js", "console.log('Hello')")
+   → NEW content written: webcontainer.fs.writeFile("app.js", "console.log('Hi')")
+   → removed from unsavedFiles Set
+
+4. User sends message to Claude
+   → getFileModifications() generates diff
+   → diff sent as context: "@@ -1 +1 @@ -console.log('Hello') +console.log('Hi')"
+   → resetAllFileModifications() clears tracking
+```
+
+---
+
+### 3. Unsaved Changes Management
+
+**Location**: `app/lib/stores/workbench.ts`
+
+```typescript
+setCurrentDocumentContent(newContent: string) {
+  const filePath = this.currentDocument.get()?.filePath;
+  const originalContent = this.#filesStore.getFile(filePath)?.content;
+
+  // Detect if content changed from what's in WebContainer
+  const unsavedChanges = originalContent !== undefined &&
+                         originalContent !== newContent;
+
+  // Update editor state
+  this.#editorStore.updateFile(filePath, newContent);
+
+  // Track unsaved status
+  const newUnsavedFiles = new Set(this.unsavedFiles.get());
+  if (unsavedChanges) {
+    newUnsavedFiles.add(filePath);
+  } else {
+    newUnsavedFiles.delete(filePath);
+  }
+  this.unsavedFiles.set(newUnsavedFiles);
+}
+```
+
+**UI Indicators**:
+
+```tsx
+// Files with unsaved changes show a dot indicator
+{Array.from(unsavedFiles).map(filePath => (
+  <div className="file-item">
+    <span>{filePath}</span>
+    <span className="unsaved-indicator">●</span>
+  </div>
+))}
+```
+
+---
+
+### 4. Sending Modifications to Claude
+
+**Critical Flow** (`app/components/chat/Chat.client.tsx`):
+
+```typescript
+const sendMessage = async (_event: React.UIEvent, messageInput?: string) => {
+  const _input = messageInput || input;
+
+  // Step 1: Save all unsaved files first
+  await workbenchStore.saveAllFiles();
+
+  // Step 2: Get modifications since last message
+  const fileModifications = workbenchStore.getFileModifications();
+
+  if (fileModifications !== undefined) {
+    // Step 3: Convert to HTML format for Claude
+    const diff = fileModificationsToHTML(fileModifications);
+
+    // Step 4: Prepend diff to user message
+    append({
+      role: 'user',
+      content: `${diff}\n\n${_input}`
+    });
+
+    // Step 5: Clear tracking (don't resend same changes)
+    workbenchStore.resetAllFileModifications();
+  } else {
+    // No modifications - send message as-is
+    append({ role: 'user', content: _input });
+  }
+};
+```
+
+**Example Context Sent to Claude**:
+
+```html
+<bolt_file_modifications>
+  <diff path="/home/project/src/App.tsx">
+    @@ -12,7 +12,10 @@
+     function App() {
+       const [count, setCount] = useState(0);
+
+    -  return <div>Count: {count}</div>;
+    +  return (
+    +    <div>
+    +      <h1>Counter</h1>
+    +      <p>Count: {count}</p>
+    +    </div>
+    +  );
+     }
+  </diff>
+
+  <file path="/home/project/package.json">
+    {
+      "name": "my-app",
+      "version": "1.0.0"
+    }
+  </file>
+</bolt_file_modifications>
+
+Now add a reset button to the counter
+```
+
+---
+
+### 5. Smart Diff Calculation
+
+**Location**: `app/utils/diff.ts`
+
+```typescript
+export function computeFileModifications(
+  files: FileMap,
+  modifiedFiles: Map<string, string>
+) {
+  const modifications: FileModifications = {};
+  let hasModifiedFiles = false;
+
+  for (const [filePath, originalContent] of modifiedFiles) {
+    const file = files[filePath];
+
+    if (file?.type !== 'file') continue;
+
+    // Generate unified diff (Git-style)
+    const unifiedDiff = diffFiles(
+      filePath,
+      originalContent,
+      file.content
+    );
+
+    if (!unifiedDiff) {
+      // Files are identical - skip
+      continue;
+    }
+
+    hasModifiedFiles = true;
+
+    // Smart choice: use diff if smaller, otherwise full file
+    if (unifiedDiff.length > file.content.length) {
+      // Diff is larger than file - send full content
+      modifications[filePath] = {
+        type: 'file',
+        content: file.content
+      };
+    } else {
+      // Diff is smaller - send diff
+      modifications[filePath] = {
+        type: 'diff',
+        content: unifiedDiff
+      };
+    }
+  }
+
+  return hasModifiedFiles ? modifications : undefined;
+}
+```
+
+**Unified Diff Format** (GNU standard):
+
+```diff
+@@ -2,7 +2,10 @@
+  return a + b;
+ }
+
+-console.log('Hello, World!');
++console.log('Hello, Bolt!');
++
+ function greet() {
+-  return 'Greetings!';
++  return 'Greetings!!';
+ }
++
++console.log('The End');
+```
+
+**Benefits**:
+- Saves tokens (diffs are usually smaller than full files)
+- Claude understands Git-style diffs natively
+- Only sends what changed, not entire codebase
+
+---
+
+### 6. Monaco Editor Synchronization
+
+**Editor Change Detection** (`app/components/editor/codemirror/CodeMirrorEditor.tsx`):
+
+```typescript
+useEffect(() => {
+  const onUpdate = debounce((update: EditorUpdate) => {
+    onChangeRef.current?.(update);
+  }, 150); // Debounce typing events
+
+  const view = new EditorView({
+    parent: containerRef.current!,
+    dispatchTransactions(transactions) {
+      view.update(transactions);
+
+      // Check if document or selection changed
+      if (transactions.some(t => t.docChanged)) {
+        onUpdate({
+          selection: view.state.selection,
+          content: view.state.doc.toString()
+        });
+      }
+    }
+  });
+
+  return () => view.destroy();
+}, []);
+```
+
+**Workbench Integration**:
+
+```tsx
+// app/components/workbench/Workbench.client.tsx
+
+const onEditorChange = useCallback<OnEditorChange>((update) => {
+  workbenchStore.setCurrentDocumentContent(update.content);
+}, []);
+
+const onFileSave = useCallback(() => {
+  workbenchStore.saveCurrentDocument();
+}, []);
+
+<CodeMirrorEditor
+  onChange={onEditorChange}  // Fires on every keystroke (debounced)
+  onSave={onFileSave}        // Fires on Ctrl+S
+  doc={editorDocument}
+/>
+```
+
+---
+
+### 7. WebContainer File System Watching
+
+**Location**: `app/lib/stores/files.ts`
+
+```typescript
+async #init() {
+  const webcontainer = await this.#webcontainer;
+
+  // Watch for ALL file system changes
+  webcontainer.internal.watchPaths(
+    {
+      include: [`${WORK_DIR}/**`],
+      exclude: ['**/node_modules/**', '.git/**'],
+      includeContent: true  // Get file contents, not just paths
+    },
+    bufferWatchEvents(100, this.#processEventBuffer.bind(this))
+  );
+}
+
+#processEventBuffer(events: Array<[events: PathWatcherEvent[]]>) {
+  const watchEvents = events.flat(2);
+
+  for (const { type, path, buffer } of watchEvents) {
+    switch (type) {
+      case 'add_file':
+        this.#size++;
+        const content = this.#decodeFileContent(buffer);
+        this.files.setKey(path, { type: 'file', content });
+        break;
+
+      case 'change':
+        const newContent = this.#decodeFileContent(buffer);
+        this.files.setKey(path, { type: 'file', content: newContent });
+        break;
+
+      case 'remove_file':
+        this.#size--;
+        this.files.setKey(path, undefined);
+        break;
+    }
+  }
+}
+```
+
+**Synchronization Flow**:
+
+```
+User types in editor → onChange (debounced 150ms) →
+setCurrentDocumentContent() → EditorStore.documents updated →
+User presses Ctrl+S → saveFile() →
+webcontainer.fs.writeFile() →
+WebContainer emits 'change' event →
+watchPaths callback fires →
+#processEventBuffer() →
+files.setKey() updates store →
+UI re-renders with new content ✓
+```
+
+---
+
+### 8. File Save Implementation
+
+**Location**: `app/lib/stores/files.ts`
+
+```typescript
+async saveFile(filePath: string, content: string) {
+  const webcontainer = await this.#webcontainer;
+  const relativePath = nodePath.relative(webcontainer.workdir, filePath);
+
+  // Get current content before overwriting
+  const oldContent = this.getFile(filePath)?.content;
+
+  // Store original content for diffing (ONLY if not already tracked)
+  if (!this.#modifiedFiles.has(filePath)) {
+    this.#modifiedFiles.set(filePath, oldContent);
+  }
+
+  try {
+    // Write to WebContainer
+    await webcontainer.fs.writeFile(relativePath, content);
+
+    // Update in-memory state
+    this.files.setKey(filePath, {
+      type: 'file',
+      content,
+      isBinary: false
+    });
+
+    this.#logger.info(`File saved: ${filePath}`);
+  } catch (error) {
+    this.#logger.error(`Failed to save file: ${filePath}`, error);
+    throw error;
+  }
+}
+```
+
+**Key Behavior**:
+- Original content captured on **first save** after last Claude message
+- Subsequent saves to same file **don't update** `#modifiedFiles` entry
+- This preserves the baseline for diffing
+
+---
+
+### 9. Resetting File Modifications
+
+**After sending message to Claude**:
+
+```typescript
+// app/lib/stores/workbench.ts
+
+resetAllFileModifications() {
+  this.#filesStore.resetModifiedFiles();
+}
+
+// app/lib/stores/files.ts
+
+resetModifiedFiles() {
+  this.#modifiedFiles.clear();
+}
+```
+
+**Why Reset?**
+- Prevents sending same diffs twice
+- Establishes new baseline after each Claude response
+- User edits after Claude's response become new modifications
+
+---
+
+### 10. Complete Edit Workflow Example
+
+**Scenario**: User asks Claude to create a React app, then edits it.
+
+```typescript
+// STEP 1: Claude creates initial files
+<boltArtifact id="app" title="React App">
+  <boltAction type="file" filePath="src/App.jsx">
+    export default function App() {
+      return <div>Hello</div>;
+    }
+  </boltAction>
+</boltArtifact>
+
+// Action executes:
+webcontainer.fs.writeFile("src/App.jsx", content);
+// #modifiedFiles is EMPTY (file not tracked)
+
+// STEP 2: User opens App.jsx in editor
+// - Content loads from files store
+// - Monaco editor displays content
+
+// STEP 3: User edits file
+// - Types: return <div>Hello World</div>;
+// - onChange fires → setCurrentDocumentContent()
+// - App.jsx added to unsavedFiles Set
+// - Dot indicator appears next to filename
+
+// STEP 4: User saves (Ctrl+S)
+saveFile("src/App.jsx", newContent);
+// #modifiedFiles.set("src/App.jsx", "export default function...")
+// WebContainer writes new content
+// App.jsx removed from unsavedFiles Set
+
+// STEP 5: User sends message "Make it blue"
+await saveAllFiles();  // Ensure everything saved
+const mods = getFileModifications();
+// mods = {
+//   "src/App.jsx": {
+//     type: "diff",
+//     content: "@@ -2 +2 @@ -return <div>Hello</div>; +return <div>Hello World</div>;"
+//   }
+// }
+
+append({
+  role: 'user',
+  content: `
+    <bolt_file_modifications>
+      <diff path="src/App.jsx">
+        @@ -2 +2 @@
+        -return <div>Hello</div>;
+        +return <div>Hello World</div>;
+      </diff>
+    </bolt_file_modifications>
+
+    Make it blue
+  `
+});
+
+resetAllFileModifications();  // Clear tracking
+
+// STEP 6: Claude responds with new <boltAction>
+<boltAction type="file" filePath="src/App.jsx">
+  export default function App() {
+    return <div style={{ color: 'blue' }}>Hello World</div>;
+  }
+</boltAction>
+
+// File overwritten in WebContainer
+// Editor reloads with new content
+// #modifiedFiles is EMPTY again (reset after last message)
+```
+
+---
+
+### 11. Key Differences: Creation vs Editing
+
+| Aspect | New File Creation | File Editing |
+|--------|-------------------|--------------|
+| **Triggered By** | Claude's `<boltAction>` | User typing in editor |
+| **API Call** | `webcontainer.fs.writeFile()` | `webcontainer.fs.writeFile()` |
+| **Tracked in `#modifiedFiles`** | ❌ No | ✅ Yes (on save) |
+| **Sent Back to Claude** | ❌ No | ✅ Yes (as diff or full content) |
+| **Appears in `unsavedFiles`** | ❌ No | ✅ Yes (until saved) |
+| **Diff Calculated** | ❌ N/A | ✅ Yes (against original) |
+| **Baseline Established** | Immediately | On first save after Claude message |
+
+---
+
+### 12. Binary File Handling
+
+```typescript
+// Files like images, PDFs are detected
+const isBinary = isBinaryFile(buffer);  // Uses 'istextorbinary' npm package
+
+if (isBinary) {
+  this.files.setKey(filePath, {
+    type: 'file',
+    content: '',  // Empty string (not displayable)
+    isBinary: true
+  });
+}
+```
+
+**Result**:
+- Binary files don't open in editor
+- Not included in modifications sent to Claude
+- Still tracked in file tree
+
+---
+
+### 13. Hot Module Reload (HMR) Persistence
+
+```typescript
+// Persist state across HMR reloads during development
+#modifiedFiles: Map<string, string> =
+  import.meta.hot?.data.modifiedFiles ?? new Map();
+
+files: MapStore<FileMap> =
+  import.meta.hot?.data.files ?? map({});
+
+if (import.meta.hot) {
+  import.meta.hot.data.files = this.files;
+  import.meta.hot.data.modifiedFiles = this.#modifiedFiles;
+}
+```
+
+**Benefit**: Developer experience - file state survives code hot-reloads.
+
+---
+
+### Summary: The Modification System
+
+Bolt.new implements a **dual-tracking system**:
+
+1. **`unsavedFiles`**: Tracks editor changes not yet written to WebContainer
+2. **`#modifiedFiles`**: Tracks saved changes not yet sent to Claude
+
+This enables:
+- **Context-aware AI**: Claude knows exactly what changed without re-reading entire projects
+- **Token efficiency**: Only diffs are sent, not full files
+- **User control**: Users can edit freely; changes only sent when they message Claude
+- **Baseline management**: System resets tracking after each Claude response
+
+The system uses the **same file operation** (`writeFile`) for both creation and editing, but the **tracking layer** intelligently distinguishes between them to provide Claude with the perfect amount of context.
+
+---
+
 ## Summary
 
 The Bolt.new agent architecture is a **parser-driven autonomous execution system** that creates an illusion of an AI agent building applications. The key components are:
