@@ -1,3 +1,4 @@
 interface Env {
-  ANTHROPIC_API_KEY: string;
+  NVIDIA_API_KEY: string;
+  ANTHROPIC_API_KEY?: string;
 }
