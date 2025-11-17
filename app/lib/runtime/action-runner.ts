@@ -178,6 +178,16 @@ export class ActionRunner {
     }
   }
 
+  abortAllActions() {
+    const actions = this.actions.get();
+
+    for (const action of Object.values(actions)) {
+      if (action.status === 'running' || action.status === 'pending') {
+        action.abort();
+      }
+    }
+  }
+
   #updateAction(id: string, newState: ActionStateUpdate) {
     const actions = this.actions.get();
 
