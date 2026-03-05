@@ -25,15 +25,31 @@ interface BaseChatProps {
   sendMessage?: (event: React.UIEvent, messageInput?: string) => void;
   handleInputChange?: (event: React.ChangeEvent<HTMLTextAreaElement>) => void;
   enhancePrompt?: () => void;
+  setInput?: (value: string) => void;
 }
 
 const EXAMPLE_PROMPTS = [
-  { text: 'Build a todo app in React using Tailwind' },
-  { text: 'Build a simple blog using Astro' },
-  { text: 'Create a cookie consent form using Material UI' },
-  { text: 'Make a space invaders game' },
-  { text: 'How do I center a div?' },
-];
+  {
+    title: 'Landing page SaaS',
+    text: 'Build a modern SaaS landing page in React with a hero, pricing section, testimonials, and FAQ.',
+    iconClass: 'i-ph:rocket-launch',
+  },
+  {
+    title: 'Dashboard analytics',
+    text: 'Create an analytics dashboard with cards, line and bar charts, and a responsive sidebar.',
+    iconClass: 'i-ph:chart-line-up',
+  },
+  {
+    title: 'API starter',
+    text: 'Generate an Express API starter with auth middleware, CRUD routes, validation, and tests.',
+    iconClass: 'i-ph:plugs-connected',
+  },
+  {
+    title: 'Game concept',
+    text: 'Build a browser mini game inspired by Space Invaders with keyboard controls and score tracking.',
+    iconClass: 'i-ph:game-controller',
+  },
+] as const;
 
 const TEXTAREA_MIN_HEIGHT = 76;
 
@@ -54,6 +70,7 @@ export const BaseChat = React.forwardRef<HTMLDivElement, BaseChatProps>(
       handleInputChange,
       enhancePrompt,
       handleStop,
+      setInput,
     },
     ref,
   ) => {
@@ -185,20 +202,40 @@ export const BaseChat = React.forwardRef<HTMLDivElement, BaseChatProps>(
               </div>
             </div>
             {!chatStarted && (
-              <div id="examples" className="relative w-full max-w-xl mx-auto mt-8 flex justify-center">
-                <div className="flex flex-col space-y-2 [mask-image:linear-gradient(to_bottom,black_0%,transparent_180%)] hover:[mask-image:none]">
+              <div id="examples" className="relative w-full max-w-4xl mx-auto mt-8 px-6">
+                <h2 className="text-sm uppercase tracking-wide text-bolt-elements-textTertiary mb-3 text-center">
+                  Start from a template
+                </h2>
+                <div className="grid grid-cols-1 md:grid-cols-2 gap-3">
                   {EXAMPLE_PROMPTS.map((examplePrompt, index) => {
                     return (
-                      <button
+                      <div
                         key={index}
-                        onClick={(event) => {
-                          sendMessage?.(event, examplePrompt.text);
-                        }}
-                        className="group flex items-center w-full gap-2 justify-center bg-transparent text-bolt-elements-textTertiary hover:text-bolt-elements-textPrimary transition-theme"
+                        className="border border-bolt-elements-borderColor rounded-lg p-3 bg-bolt-elements-background-depth-2"
                       >
-                        {examplePrompt.text}
-                        <div className="i-ph:arrow-bend-down-left" />
-                      </button>
+                        <button
+                          onClick={(event) => {
+                            sendMessage?.(event, examplePrompt.text);
+                          }}
+                          className="w-full text-left mb-3"
+                        >
+                          <div className="flex items-center gap-2 text-bolt-elements-textPrimary font-medium">
+                            <div className={classNames(examplePrompt.iconClass, 'text-lg')} />
+                            {examplePrompt.title}
+                          </div>
+                          <p className="mt-1 text-sm text-bolt-elements-textTertiary">{examplePrompt.text}</p>
+                        </button>
+                        <button
+                          className="text-xs text-bolt-elements-item-contentAccent hover:text-bolt-elements-item-contentAccentHover transition-theme"
+                          onClick={(event) => {
+                            event.preventDefault();
+                            event.stopPropagation();
+                            setInput?.(examplePrompt.text);
+                          }}
+                        >
+                          Use as editable prompt
+                        </button>
+                      </div>
                     );
                   })}
                 </div>
