@@ -212,6 +212,11 @@ export const ChatImpl = memo(({ initialMessages, storeMessageHistory }: ChatProp
       messageRef={messageRef}
       scrollRef={scrollRef}
       handleInputChange={handleInputChange}
+      setInput={(value) => {
+        setInput(value);
+        textareaRef.current?.focus();
+        scrollTextArea();
+      }}
       handleStop={abort}
       messages={messages.map((message, i) => {
         if (message.role === 'user') {
